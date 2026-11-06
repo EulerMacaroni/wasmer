@@ -355,11 +355,6 @@ impl WasiInodes {
         }
     }
 
-    /// Get the `VirtualFile` object at stdout mutably
-    pub(crate) fn stdout_mut(fd_map: &RwLock<FdList>) -> Result<InodeValFileWriteGuard, FsError> {
-        Self::std_dev_get_mut(fd_map, __WASI_STDOUT_FILENO)
-    }
-
     /// Get the `VirtualFile` object at stderr mutably
     pub(crate) fn stderr_mut(fd_map: &RwLock<FdList>) -> Result<InodeValFileWriteGuard, FsError> {
         Self::std_dev_get_mut(fd_map, __WASI_STDERR_FILENO)
@@ -1047,17 +1042,27 @@ impl WasiFs {
         mut file: Box<dyn VirtualFile + Send + Sync + 'static>,
     ) -> Result<Option<Box<dyn VirtualFile + Send + Sync + 'static>>, FsError> {
         match fd {
-            __WASI_STDIN_FILENO => {
-                let mut target = WasiInodes::stdin_mut(&self.fd_map)?;
-                Ok(Some(target.swap(file)))
-            }
-            __WASI_STDOUT_FILENO => {
-                let mut target = WasiInodes::stdout_mut(&self.fd_map)?;
-                Ok(Some(target.swap(file)))
-            }
-            __WASI_STDERR_FILENO => {
-                let mut target = WasiInodes::stderr_mut(&self.fd_map)?;
-                Ok(Some(target.swap(file)))
+            __WASI_STDIN_FILENO | __WASI_STDOUT_FILENO | __WASI_STDERR_FILENO => {
+                let filetype = if file.get_special_fd().is_some() {
+                    Filetype::CharacterDevice
+                } else {
+                    Filetype::RegularFile
+                };
+                let inode = self.get_fd_inode(fd).map_err(fs_error_from_wasi_err)?;
+                let guard = inode.read();
+                let Kind::File {
+                    handle: Some(handle),
+                    ..
+                } = guard.deref()
+                else {
+                    return Err(FsError::NotAFile);
+                };
+                let mut target = InodeValFileWriteGuard::new(handle);
+                let mut stat = inode.stat.write().map_err(|_| FsError::Lock)?;
+                // Keep the backing and its type on the same captured inode when stdio is redirected.
+                let previous = target.swap(file);
+                stat.st_filetype = filetype;
+                Ok(Some(previous))
             }
             _ => {
                 let base_inode = self.get_fd_inode(fd).map_err(fs_error_from_wasi_err)?;
@@ -1841,24 +1846,30 @@ impl WasiFs {
     pub fn fdstat(&self, fd: WasiFd) -> Result<Fdstat, Errno> {
         match fd {
             __WASI_STDIN_FILENO => {
+                let inode = self.get_fd_inode(fd)?;
+                let stat = inode.stat.read().unwrap();
                 return Ok(Fdstat {
-                    fs_filetype: Filetype::CharacterDevice,
+                    fs_filetype: stat.st_filetype,
                     fs_flags: Fdflags::empty(),
                     fs_rights_base: STDIN_DEFAULT_RIGHTS,
                     fs_rights_inheriting: Rights::empty(),
                 });
             }
             __WASI_STDOUT_FILENO => {
+                let inode = self.get_fd_inode(fd)?;
+                let stat = inode.stat.read().unwrap();
                 return Ok(Fdstat {
-                    fs_filetype: Filetype::CharacterDevice,
+                    fs_filetype: stat.st_filetype,
                     fs_flags: Fdflags::APPEND,
                     fs_rights_base: STDOUT_DEFAULT_RIGHTS,
                     fs_rights_inheriting: Rights::empty(),
                 });
             }
             __WASI_STDERR_FILENO => {
+                let inode = self.get_fd_inode(fd)?;
+                let stat = inode.stat.read().unwrap();
                 return Ok(Fdstat {
-                    fs_filetype: Filetype::CharacterDevice,
+                    fs_filetype: stat.st_filetype,
                     fs_flags: Fdflags::APPEND,
                     fs_rights_base: STDERR_DEFAULT_RIGHTS,
                     fs_rights_inheriting: Rights::empty(),
@@ -2905,6 +2916,46 @@ mod tests {
 
     use crate::WasiEnvBuilder;
     use crate::bin_factory::{BinaryPackage, BinaryPackageMount, BinaryPackageMounts};
+
+    #[tokio::test]
+    async fn redirected_stdio_reports_its_backing_type() {
+        let inodes = WasiInodes::new();
+        let fs_backing =
+            WasiFsRoot::from_filesystem(Arc::new(RootFileSystemBuilder::default().build_tmp()));
+        let wasi_fs = WasiFs::new_init(fs_backing, &inodes, FS_ROOT_INO).unwrap();
+
+        for fd in [
+            __WASI_STDIN_FILENO,
+            __WASI_STDOUT_FILENO,
+            __WASI_STDERR_FILENO,
+        ] {
+            assert_eq!(
+                wasi_fs.fdstat(fd).unwrap().fs_filetype,
+                Filetype::CharacterDevice
+            );
+            let previous = wasi_fs
+                .swap_file(fd, Box::<virtual_fs::NullFile>::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                wasi_fs.fdstat(fd).unwrap().fs_filetype,
+                Filetype::RegularFile
+            );
+            assert_eq!(
+                wasi_fs.filestat_fd(fd).unwrap().st_filetype,
+                Filetype::RegularFile
+            );
+            wasi_fs.swap_file(fd, previous).unwrap();
+            assert_eq!(
+                wasi_fs.fdstat(fd).unwrap().fs_filetype,
+                Filetype::CharacterDevice
+            );
+            assert_eq!(
+                wasi_fs.filestat_fd(fd).unwrap().st_filetype,
+                Filetype::CharacterDevice
+            );
+        }
+    }
 
     fn webc_symlink_fs() -> virtual_fs::WebcVolumeFileSystem {
         let timestamps = webc::v3::Timestamps::default();
